@@ -1,0 +1,18 @@
+# Python environment
+.venv/
+__pycache__/
+*.pyc
+
+# Local Data and Databases (NEVER COMMIT)
+data/
+*.db
+*.sqlite3
+
+# Large AI Models and Weights (Crucial for Pillar 2 & 3)
+*.gguf
+*.bin
+*.safetensors
+*.pt
+
+# Environment Variables (Secrets/API Keys)
+.env
