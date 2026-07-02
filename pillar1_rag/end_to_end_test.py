@@ -2,6 +2,42 @@ import sqlite3
 import requests
 from dynamic_graph_rag import DynamicSchemaEngine
 
+def get_smart_sql_hint(error_message):
+    """
+    Analyzes raw SQLite errors and returns intelligent, LLM-friendly hints.
+    """
+    error_str = str(error_message).lower()
+    
+    if "no such column" in error_str:
+        return (
+            f"Database Error: {error_message}\n"
+            "Smart Hint: You referenced a column that does not exist. "
+            "1) Check if you used an undefined alias (e.g., 'e.first_name' instead of 'employees.first_name'). "
+            "2) Verify the column name matches the schema EXACTLY."
+        )
+    elif "no such table" in error_str:
+        return (
+            f"Database Error: {error_message}\n"
+            "Smart Hint: You tried to query a table that doesn't exist. "
+            "Do not hallucinate table names. ONLY use the tables explicitly provided in the Schema Context."
+        )
+    elif "ambiguous column name" in error_str:
+        return (
+            f"Database Error: {error_message}\n"
+            "Smart Hint: A column name you used exists in multiple joined tables. "
+            "You must prefix the column with its exact table name (e.g., 'Track.Name' instead of just 'Name')."
+        )
+    elif "syntax error" in error_str:
+        return (
+            f"Database Error: {error_message}\n"
+            "Smart Hint: Your SQL has a syntax error. Check your JOIN conditions, missing AND/OR operators, "
+            "or misplaced commas."
+        )
+    else:
+        # Fallback for unknown errors
+        return f"Database Error: {error_message}\nSmart Hint: Review your SQL logic and ensure it perfectly matches the provided schema."
+
+
 print("==================================================")
 print("   ENTERPRISE MULTI-AGENT DATABASE SELECTOR")
 print("==================================================")
@@ -42,10 +78,19 @@ while True:
     print("\n[Step 1/4] Retrieving schema context via dynamic graph extraction...")
     schema_context = engine.retrieve_optimized_context(user_query)
 
-    # Step B: Build prompt
+    # Step B: Build prompt with Few-Shot Examples
     prompt = f"""You are an expert SQL generator. Write a valid SQLite query to answer the request.
 Output ONLY the raw SQL query string. Do not use markdown blocks, backticks, or text explanations.
 CRITICAL RULE: Do NOT use table aliases (e.g. use employees.first_name instead of e.first_name). Use explicit JOINs.
+CRITICAL RULE: SQLite does not support the TOP keyword. Always use LIMIT at the end of the query.
+
+--- Example 1 ---
+Request: Find the 3 most popular genres
+SQL: SELECT Genre.Name, COUNT(Track.TrackId) AS TrackCount FROM Genre JOIN Track ON Genre.GenreId = Track.GenreId GROUP BY Genre.Name ORDER BY TrackCount DESC LIMIT 3
+
+--- Example 2 ---
+Request: Get employee names and their department
+SQL: SELECT employees.first_name, employees.last_name, departments.department_name FROM employees JOIN departments ON employees.department_id = departments.id
 
 Schema Context:
 {schema_context}
@@ -55,7 +100,7 @@ SQL Query:"""
 
     print("\n[Agent 2] Forwarding context to local Phi-3 server...")
     
-    max_retries = 3
+    max_retries = 5
     current_prompt = prompt
     success = False
 
@@ -104,11 +149,21 @@ SQL Query:"""
             break # Exit the loop, query succeeded!
 
         except sqlite3.OperationalError as db_error:
-            # AGENT 3 CATCHES ERROR
-            print(f" -> [Agent 3 Triggered]: Database rejected query. Error: {db_error}")
+            # AGENT 3 CATCHES ERROR AND GENERATES SMART HINT
+            print(f" -> [Agent 3 Triggered]: Database rejected query.")
+            
+            smart_feedback = get_smart_sql_hint(db_error)
+            print(f" -> {smart_feedback}")
+            
             if attempt < max_retries - 1:
                 print(" -> Feedback loop initiated. Forcing LLM to rewrite...")
-                current_prompt += f"\n\nYour previous SQL query:\n{cleaned_sql}\n\nFailed with this database error: {db_error}\nRewrite the query to fix this error. Output ONLY the raw SQL."
+                
+                # Append the smart feedback to the prompt instead of just the raw error
+                current_prompt += (
+                    f"\n\nYour previous SQL query:\n{cleaned_sql}\n\n"
+                    f"Failed with this error:\n{smart_feedback}\n\n"
+                    "Rewrite the query to fix this error. Output ONLY the raw SQL."
+                )
             conn.close()
             
         except requests.exceptions.ConnectionError:
@@ -119,4 +174,4 @@ SQL Query:"""
             break
 
     if not success:
-        print("\n[Pipeline Aborted] The AI failed to write a valid query after 3 attempts.")
+        print("\n[Pipeline Aborted] The AI failed to write a valid query after 5 attempts.")

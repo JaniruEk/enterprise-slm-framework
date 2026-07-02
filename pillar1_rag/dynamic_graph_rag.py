@@ -1,4 +1,5 @@
 import sqlite3
+import re
 # pyrefly: ignore [missing-import]
 import chromadb
 
@@ -85,6 +86,105 @@ class DynamicSchemaEngine:
             
         return resolved_set
 
+    def prune_ddl(self, ddl, query):
+        """Filters out columns from the DDL that are highly likely to be irrelevant to the query."""
+        lines = ddl.split('\n')
+        header = ""
+        footer = ");"
+        col_lines = []
+        
+        query_lower = query.lower()
+        query_words = re.findall(r'\b\w+\b', query_lower)
+        
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith("CREATE TABLE"):
+                header = line
+                continue
+            if stripped.endswith(");") or stripped == ")":
+                footer = line
+                continue
+                
+            is_constraint = False
+            for kw in ["FOREIGN KEY", "PRIMARY KEY", "UNIQUE", "CHECK", "CONSTRAINT"]:
+                if stripped.upper().startswith(kw):
+                    is_constraint = True
+                    break
+                    
+            if is_constraint:
+                col_lines.append((line, True))
+                continue
+                
+            match = re.match(r'^["`\[]?(\w+)["`\]]?', stripped)
+            if not match:
+                col_lines.append((line, True))
+                continue
+                
+            col_name = match.group(1)
+            col_name_lower = col_name.lower()
+            
+            keep = False
+            
+            if "PRIMARY KEY" in stripped.upper() or "REFERENCES" in stripped.upper():
+                keep = True
+            elif "id" in col_name_lower:
+                keep = True
+            elif col_name_lower in query_lower:
+                keep = True
+            elif col_name_lower in ["name", "title", "subject", "label", "email", "phone"]:
+                keep = True
+            else:
+                for word in query_words:
+                    if len(word) > 2 and word in col_name_lower:
+                        keep = True
+                        break
+                        
+            if not keep:
+                synonyms = {
+                    "song": ["name", "title"],
+                    "track": ["name", "title"],
+                    "employee": ["last_name", "first_name"],
+                    "customer": ["last_name", "first_name"],
+                    "cost": ["unitprice", "total", "price"],
+                    "salary": ["base_salary", "salary"],
+                    "popular": ["count", "total"]
+                }
+                for syn, target_cols in synonyms.items():
+                    if syn in query_lower and col_name_lower in target_cols:
+                        keep = True
+                        break
+                        
+            col_lines.append((line, keep))
+            
+        has_data_col = False
+        for line, keep in col_lines:
+            if keep:
+                line_upper = line.upper().strip()
+                is_constraint = False
+                for kw in ["FOREIGN KEY", "PRIMARY KEY", "UNIQUE", "CHECK", "CONSTRAINT"]:
+                    if line_upper.startswith(kw):
+                        is_constraint = True
+                        break
+                if not is_constraint and "ID" not in line_upper:
+                    has_data_col = True
+                    break
+                    
+        if not has_data_col:
+            kept_lines = [line.strip() for line, _ in col_lines]
+        else:
+            kept_lines = [line.strip() for line, keep in col_lines if keep]
+            
+        cleaned_lines = []
+        for line in kept_lines:
+            if line.endswith(","):
+                line = line[:-1]
+            cleaned_lines.append(line)
+            
+        formatted_body = ",\n    ".join(cleaned_lines)
+        return f"{header}\n    {formatted_body}\n{footer}"
+
     def retrieve_optimized_context(self, query):
         """Hybrid search combining semantic search anchors with structural reflection loops."""
         semantic_results = self.collection.query(query_texts=[query], n_results=1)
@@ -98,4 +198,5 @@ class DynamicSchemaEngine:
         print(f"[Graph Traversal] Identified necessary cluster: {list(all_required_tables)}")
         
         final_context_blocks = [self.get_table_ddl(t) for t in sorted(all_required_tables)]
-        return "\n\n".join(final_context_blocks)
+        pruned_blocks = [self.prune_ddl(block, query) for block in final_context_blocks]
+        return "\n\n".join(pruned_blocks)
